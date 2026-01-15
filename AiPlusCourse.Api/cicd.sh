@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ================= 配置区 =================
-# 注意：请根据实际服务器部署路径修改 PROJECT_DIR
-PROJECT_DIR="/root/code/AiPlusCourse.Api"
+# 自动获取脚本所在目录作为项目根目录
+PROJECT_DIR=$(cd "$(dirname "$0")"; pwd)
 IMAGE_NAME="aipluscourse-api"
 CONTAINER_NAME="aipluscourse-api"
 PORT=7001
@@ -13,14 +13,9 @@ log() {
 }
 
 log "====== 开始自动化部署 (安全备份模式) ======"
+log "📂 工作目录: $PROJECT_DIR"
 
 # 1. 进入目录 & 拉取代码
-if [ ! -d "$PROJECT_DIR" ]; then
-  # 如果指定目录不存在，尝试使用当前目录
-  log "⚠️ 提示：找不到配置的项目目录 $PROJECT_DIR，尝试使用当前目录..."
-  PROJECT_DIR=$(pwd)
-fi
-
 cd "$PROJECT_DIR" || exit
 log "1. 拉取最新代码..."
 git pull origin master
