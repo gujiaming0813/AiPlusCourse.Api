@@ -48,9 +48,9 @@ fi
 # 5. 启动新容器
 log "5. 启动新容器 (端口: $PORT)..."
 # 注意：容器内部端口为 7001 (对应 Dockerfile 配置)
-docker run -d -p $PORT:7001 --name $CONTAINER_NAME --restart=always $IMAGE_NAME:latest --network app-network
+docker run -d -p $PORT:7001 --name $CONTAINER_NAME --restart=always --network app-network $IMAGE_NAME:latest
 
-# 6. 健康检查与决策 (核心逻辑修改)
+# 6. 健康检查与决策 (核心逻辑修改) 
 log "6. 等待 10 秒进行健康检查..."
 sleep 10
 
@@ -89,7 +89,7 @@ else
         docker tag $IMAGE_NAME:pre-deploy $IMAGE_NAME:latest
         
         # 启动旧版
-        docker run -d -p $PORT:7001 --name $CONTAINER_NAME --restart=always $IMAGE_NAME:latest
+        docker run -d -p $PORT:7001 --name $CONTAINER_NAME --restart=always --network app-network $IMAGE_NAME:latest
         
         # 清理临时标签
         docker rmi $IMAGE_NAME:pre-deploy
