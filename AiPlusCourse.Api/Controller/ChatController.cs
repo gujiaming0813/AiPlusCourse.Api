@@ -1,63 +1,147 @@
 using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
 using System.Text;
+using System.Text.Json.Nodes;
 namespace AiPlusCourse.Api.Controller;
 
 [Route("api/[controller]")]
 [ApiController]
-public class ChatController : ControllerBase
+public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration configuration) : ControllerBase
 {
+    private readonly IHttpClientFactory _httpClientFactory = httpClientFactory;
+    private readonly IConfiguration _configuration = configuration;
+
     // 定义请求模型
     public class ChatRequest
     {
-        public string Message { get; set; }
+        public string Message { get; set; } = null!;
+        public string? SessionId { get; set; }
+        public int Level { get; set; } = 1;
     }
 
     [HttpPost("stream")]
-    public async Task Stream([FromBody] ChatRequest request)
+    public async Task Stream(ChatRequest request)
     {
-        // 1. 设置响应头，告诉浏览器这是一个流
-        Response.ContentType = "text/plain"; 
-        // 如果你是做标准 SSE，可以用 "text/event-stream"，但你前端是直接读流，text/plain 也可以
-            
-        // 禁用缓存
-        Response.Headers["Cache-Control"] = "no-cache";
-        Response.Headers["Connection"] = "keep-alive";
+        // 1. 设置响应头：纯文本流
+        Response.ContentType = "text/plain";
+        Response.Headers.CacheControl = "no-cache";
+        Response.Headers.Connection = "keep-alive";
 
-        try
+        // 2. 准备请求数据 (完全复用你的逻辑)
+        var url = configuration["Url"]!;
+
+        var body = new
+                   {
+                       input = new
+                               {
+                                   prompt = request.Message,
+                                   session_id = request.SessionId,
+                                   biz_params = new
+                                                {
+                                                    user_prompt_params = new
+                                                                         {
+                                                                             level = request.Level
+                                                                         }
+                                                },
+                                   parameters = new
+                                                {
+                                                    incremental_output = true,
+                                                    has_thoughts = true
+                                                },
+                                   debug = new
+                                           {
+                                           },
+                               }
+                   };
+
+        // 3. 发起请求
+        var client = _httpClientFactory.CreateClient();
+        client.DefaultRequestHeaders.Add("Authorization", $"Bearer {configuration["Key"]}");
+        client.DefaultRequestHeaders.Add("X-DashScope-SSE", $"enable");
+
+        string jsonContent = JsonConvert.SerializeObject(body);
+        HttpContent content = new StringContent(jsonContent,
+                                                Encoding.UTF8,
+                                                "application/json");
+
+        var upstreamRequest = new HttpRequestMessage(HttpMethod.Post, url);
+        upstreamRequest.Content = content;
+
+        // 4. 获取流式响应
+        // ResponseHeadersRead: 只要头返回了就开始读，不要等整个 Body
+        using var response = await client.SendAsync(upstreamRequest, HttpCompletionOption.ResponseHeadersRead);
+
+        if (!response.IsSuccessStatusCode)
         {
-            // 获取用户输入
-            var userMessage = request?.Message ?? "";
-
-            // --- 模拟 AI 的回复内容 (之后这里替换为真实的 Gemini API 调用) ---
-            var aiResponseText = $"[后端回复] 我收到了你的消息：{userMessage}。\n\n" +
-                                 "这是一段来自 .NET API 的流式响应测试。\n" +
-                                 "后端正在逐字生成内容... \n" +
-                                 "10%... \n" +
-                                 "50%... \n" +
-                                 "100% 完成！🚀";
-
-            // --- 开始流式输出 ---
-            // 我们把字符串拆成字符，模拟打字机效果
-            foreach (var character in aiResponseText)
-            {
-                // 将字符转换为字节
-                var buffer = Encoding.UTF8.GetBytes(character.ToString());
-
-                // 写入响应流
-                await Response.Body.WriteAsync(buffer, 0, buffer.Length);
-                    
-                // 关键：立即刷新缓冲区，让前端能马上收到，而不是等攒够了一起发
-                await Response.Body.FlushAsync();
-
-                // 模拟思考延迟 (50毫秒)
-                await Task.Delay(50); 
-            }
+            var errorMsg = await response.Content.ReadAsStringAsync();
+            await Response.Body.WriteAsync(Encoding.UTF8.GetBytes($"[Error] {response.StatusCode}: {errorMsg}"));
+            return;
         }
-        catch (Exception ex)
+
+        using var stream = await response.Content.ReadAsStreamAsync();
+        using var reader = new StreamReader(stream);
+
+        string? line;
+        string lastText = "";
+        var isHeaderSet = false;
+
+        while ((line = await reader.ReadLineAsync()) != null)
         {
-            // 错误处理
-            var errorMsg = Encoding.UTF8.GetBytes($"\n[Error] {ex.Message}");
-            await Response.Body.WriteAsync(errorMsg, 0, errorMsg.Length);
+            if (line.StartsWith("data:"))
+            {
+                var dataJson = line.Substring(5).Trim();
+                if (string.IsNullOrEmpty(dataJson)) continue;
+
+                try
+                {
+                    var jsonNode = JsonNode.Parse(dataJson);
+
+                    if (!isHeaderSet && !Response.HasStarted)
+                    {
+                        var sessionId = jsonNode?["output"]?["session_id"]?.ToString();
+                        if (!string.IsNullOrEmpty(sessionId))
+                        {
+                            // 允许前端读取这个 Header
+                            Response.Headers["Access-Control-Expose-Headers"] = "X-Session-Id";
+                            Response.Headers["X-Session-Id"] = sessionId;
+                            isHeaderSet = true;
+                            // Console.WriteLine($"[Debug] SessionId set: {sessionId}"); // 调试用
+                        }
+                    }
+
+                    // 获取当前的全量文本
+                    var currentFullText = jsonNode?["output"]?["text"]?.ToString() ?? "";
+
+                    // 👇 2. 计算增量 (Delta)
+                    // 如果当前全量文本比上一次的长，说明有新内容
+                    if (currentFullText.Length > lastText.Length)
+                    {
+                        // 截取掉前面已经发过的部分，只留新多出来的部分
+                        var delta = currentFullText.Substring(lastText.Length);
+
+                        // 更新“上次内容”为“当前内容”，为下一次做准备
+                        lastText = currentFullText;
+
+                        // 👇 3. 只发送增量给前端
+                        if (!string.IsNullOrEmpty(delta))
+                        {
+                            var buffer = Encoding.UTF8.GetBytes(delta);
+                            await Response.Body.WriteAsync(buffer);
+                            await Response.Body.FlushAsync();
+                        }
+                    }
+
+                    var finishReason = jsonNode?["output"]?["finish_reason"]?.ToString();
+                    if (finishReason == "stop")
+                    {
+                        break;
+                    }
+                }
+                catch
+                {
+                    // 忽略解析错误
+                }
+            }
         }
     }
 }
