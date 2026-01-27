@@ -22,6 +22,11 @@ public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration
     [HttpPost("stream")]
     public async Task Stream(ChatRequest request)
     {
+        var responseFeature = HttpContext.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
+        if (responseFeature != null)
+        {
+            responseFeature.DisableBuffering();
+        }
         // 1. 设置响应头
         Response.ContentType = "application/json";
         Response.Headers.CacheControl = "no-cache";
