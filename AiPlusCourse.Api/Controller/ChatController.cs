@@ -22,59 +22,55 @@ public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration
     [HttpPost("stream")]
     public async Task Stream(ChatRequest request)
     {
-        // 1. 设置响应头：纯文本流
-        Response.ContentType = "text/plain";
+        // 1. 设置响应头
+        Response.ContentType = "application/json";
         Response.Headers.CacheControl = "no-cache";
         Response.Headers.Connection = "keep-alive";
 
-        // 2. 准备请求数据 (完全复用你的逻辑)
+        // 2. 准备请求数据
         var url = configuration["Url"]!;
-
-        var body = new
-                   {
-                       input = new
-                               {
-                                   prompt = request.Message,
-                                   session_id = request.SessionId,
-                                   biz_params = new
-                                                {
-                                                    user_prompt_params = new
-                                                                         {
-                                                                             level = request.Level
-                                                                         }
-                                                },
-                                   parameters = new
-                                                {
-                                                    incremental_output = true,
-                                                    has_thoughts = true
-                                                },
-                                   debug = new
-                                           {
-                                           },
-                               }
-                   };
+        var jsonString = $@"{{
+        ""input"": {{
+            ""prompt"": ""{request.Message}"",
+            ""session_id"": ""{request.SessionId}"",
+            ""biz_params"": {{
+                ""user_prompt_params"": {{
+                    ""level"": ""{request.Level}""
+                }}
+            }}
+        }},
+        ""parameters"": {{
+            ""has_thoughts"": true,
+            ""enable_thinking"": true,
+            ""incremental_output"": true
+        }},
+        ""debug"": {{}}
+    }}";
 
         // 3. 发起请求
         var client = _httpClientFactory.CreateClient();
         client.DefaultRequestHeaders.Add("Authorization", $"Bearer {configuration["Key"]}");
         client.DefaultRequestHeaders.Add("X-DashScope-SSE", $"enable");
 
-        string jsonContent = JsonConvert.SerializeObject(body);
-        HttpContent content = new StringContent(jsonContent,
-                                                Encoding.UTF8,
-                                                "application/json");
-
-        var upstreamRequest = new HttpRequestMessage(HttpMethod.Post, url);
-        upstreamRequest.Content = content;
+        var content = new StringContent(jsonString, Encoding.UTF8, "application/json");
+        var upstreamRequest = new HttpRequestMessage(HttpMethod.Post, url)
+                              {
+                                  Content = content
+                              };
 
         // 4. 获取流式响应
-        // ResponseHeadersRead: 只要头返回了就开始读，不要等整个 Body
         using var response = await client.SendAsync(upstreamRequest, HttpCompletionOption.ResponseHeadersRead);
 
         if (!response.IsSuccessStatusCode)
         {
             var errorMsg = await response.Content.ReadAsStringAsync();
-            await Response.Body.WriteAsync(Encoding.UTF8.GetBytes($"[Error] {response.StatusCode}: {errorMsg}"));
+            // 发送错误类型的 JSON
+            var errPayload = System.Text.Json.JsonSerializer.Serialize(new
+                                                                       {
+                                                                           type = "error",
+                                                                           content = $"{response.StatusCode}: {errorMsg}"
+                                                                       });
+            await Response.Body.WriteAsync(Encoding.UTF8.GetBytes(errPayload + "\n"));
             return;
         }
 
@@ -82,7 +78,10 @@ public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration
         using var reader = new StreamReader(stream);
 
         string? line;
+        // 记录上一次的正文全文
         string lastText = "";
+        // 记录上一次的思考全文
+        string lastThought = "";
         var isHeaderSet = false;
 
         while ((line = await reader.ReadLineAsync()) != null)
@@ -90,48 +89,65 @@ public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration
             if (line.StartsWith("data:"))
             {
                 var dataJson = line.Substring(5).Trim();
+                // Console.WriteLine(dataJson);
                 if (string.IsNullOrEmpty(dataJson)) continue;
 
                 try
                 {
                     var jsonNode = JsonNode.Parse(dataJson);
 
+                    // 处理 SessionId
                     if (!isHeaderSet && !Response.HasStarted)
                     {
                         var sessionId = jsonNode?["output"]?["session_id"]?.ToString();
                         if (!string.IsNullOrEmpty(sessionId))
                         {
-                            // 允许前端读取这个 Header
                             Response.Headers["Access-Control-Expose-Headers"] = "X-Session-Id";
                             Response.Headers["X-Session-Id"] = sessionId;
                             isHeaderSet = true;
-                            // Console.WriteLine($"[Debug] SessionId set: {sessionId}"); // 调试用
                         }
                     }
 
-                    // 获取当前的全量文本
-                    var currentFullText = jsonNode?["output"]?["text"]?.ToString() ?? "";
+                    var outputNode = jsonNode?["output"];
+                    if (outputNode == null) continue;
 
-                    // 👇 2. 计算增量 (Delta)
-                    // 如果当前全量文本比上一次的长，说明有新内容
-                    if (currentFullText.Length > lastText.Length)
+                    // --- 处理思考过程 (Thoughts) ---
+                    var currentThought = outputNode["thoughts"]?[0]?["thought"]?.ToString() ?? "";
+
+                    // var thoughtDelta = currentThought.Substring(lastThought.Length);
+                    lastThought = currentThought;
+
+                    if (!string.IsNullOrEmpty(currentThought))
                     {
-                        // 截取掉前面已经发过的部分，只留新多出来的部分
-                        var delta = currentFullText.Substring(lastText.Length);
-
-                        // 更新“上次内容”为“当前内容”，为下一次做准备
-                        lastText = currentFullText;
-
-                        // 👇 3. 只发送增量给前端
-                        if (!string.IsNullOrEmpty(delta))
-                        {
-                            var buffer = Encoding.UTF8.GetBytes(delta);
-                            await Response.Body.WriteAsync(buffer);
-                            await Response.Body.FlushAsync();
-                        }
+                        // 构造自定义协议: { "type": "thought", "content": "..." }
+                        var payload = System.Text.Json.JsonSerializer.Serialize(new
+                                                                                {
+                                                                                    type = "thought",
+                                                                                    content = currentThought
+                                                                                });
+                        await Response.Body.WriteAsync(Encoding.UTF8.GetBytes(payload + "\n"));//以此换行符为分隔
+                        await Response.Body.FlushAsync();
                     }
 
-                    var finishReason = jsonNode?["output"]?["finish_reason"]?.ToString();
+                    // --- 处理正文回复 (Text) ---
+                    var currentText = outputNode["text"]?.ToString() ?? "";
+                    // var textDelta = currentText.Substring(lastText.Length);
+                    lastText = currentText;
+
+                    if (!string.IsNullOrEmpty(currentText))
+                    {
+                        // 构造自定义协议: { "type": "text", "content": "..." }
+                        var payload = System.Text.Json.JsonSerializer.Serialize(new
+                                                                                {
+                                                                                    type = "text",
+                                                                                    content = currentText
+                                                                                });
+                        await Response.Body.WriteAsync(Encoding.UTF8.GetBytes(payload + "\n"));
+                        await Response.Body.FlushAsync();
+                    }
+
+                    // 检查结束
+                    var finishReason = outputNode["finish_reason"]?.ToString();
                     if (finishReason == "stop")
                     {
                         break;
