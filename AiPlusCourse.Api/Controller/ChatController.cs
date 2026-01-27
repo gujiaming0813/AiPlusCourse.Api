@@ -28,7 +28,7 @@ public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration
             responseFeature.DisableBuffering();
         }
         // 1. 设置响应头
-        Response.ContentType = "application/json";
+        Response.ContentType = "text/event-stream";
         Response.Headers.CacheControl = "no-cache";
         Response.Headers.Connection = "keep-alive";
 
