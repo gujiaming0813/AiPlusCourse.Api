@@ -31,6 +31,7 @@ public class ChatController(IHttpClientFactory httpClientFactory, IConfiguration
         Response.ContentType = "text/event-stream";
         Response.Headers.CacheControl = "no-cache";
         Response.Headers.Connection = "keep-alive";
+        Response.Headers["X-Accel-Buffering"] = "no";
 
         // 2. 准备请求数据
         var url = configuration["Url"]!;
